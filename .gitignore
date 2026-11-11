@@ -1,0 +1,19 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Rdata
+.httr-oauth
+*_cache/
+*_files/
+# Quarto
+/.quarto/
+analisis_vaquita_mayo.html
+# Resultados generados (se reproducen con el código)
+resultados/
+figuras_extenso/salida/
+# Datos completos del análisis principal (no incluidos en el repositorio)
+datos/
+# Sistema
+.DS_Store
+Thumbs.db

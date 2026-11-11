@@ -1,0 +1,583 @@
+---
+title: "Actividad acústica de la vaquita marina en la ATC durante mayo"
+subtitle: "Flujo de análisis reproducible en R (cruceros de mayo de 2023, 2024 y 2026; versión simplificada)"
+author:
+  - Rosa Isela Burciaga de la Rocha
+  - Tania Valdivia Carrillo
+date: today
+lang: es
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    df-print: kable
+    fig-width: 7.2
+    fig-height: 3.8
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  B: 2000
+---
+
+# Cómo usar este documento {.unnumbered}
+
+Este archivo reúne todo el análisis del extenso, desde las tablas de datos hasta las figuras y los cuadros de resultados. Responde tres preguntas:
+
+1. **¿Cambia la actividad acústica con la hora del día y con la marea en mayo?** (Análisis 1)
+2. **¿Dónde se concentra la actividad, y ese núcleo se confirma con datos independientes?** (Análisis 2)
+3. **¿Cómo se relaciona la actividad de mayo con los polígonos y horarios del Acuerdo de 2026?** (Análisis 3)
+
+Cada sección explica qué se hace y por qué, y después muestra el código. Para correrlo:
+
+1. Abre `vaquita_acustica_R.Rproj` en RStudio, para que todas las rutas funcionen desde la carpeta del proyecto.
+2. Instala los paquetes de la sección de configuración si no los tienes (una sola vez).
+3. Presiona **Render**. El documento se genera en HTML y guarda las tablas en `resultados/tablas/` y las figuras en `resultados/figuras/`.
+
+El parámetro `B` (número de réplicas del bootstrap) vale 2000. Para pruebas rápidas puedes renderizar con menos réplicas desde la consola: `quarto::quarto_render("analisis_vaquita_mayo.qmd", execute_params = list(B = 200))`. Los intervalos cambiarán un poco, pero las estimaciones no.
+
+**Estructura de carpetas**
+
+```
+vaquita_acustica_R/
+├── analisis_vaquita_mayo.qmd   este documento
+├── vaquita_acustica_R.Rproj    proyecto de RStudio (define la carpeta raíz)
+├── R/funciones.R               funciones auxiliares, comentadas
+├── datos/
+│   ├── crudos/                 tablas extraídas y verificadas de los reportes (no se modifican)
+│   │   └── mareas/             pleamares y bajamares de CICESE, San Felipe
+│   ├── externos/               polígonos del DOF, avistamientos de 2026
+│   └── procesados/             tablas que genera este documento
+└── resultados/
+    ├── tablas/                 resultados en CSV
+    └── figuras/                figuras en PNG (300 dpi) y PDF
+```
+
+Las tablas de `datos/crudos/` se extrajeron de los PDF de los reportes y se comprobó que sus totales coinciden con lo publicado; esa extracción está documentada en la base de datos original (`LEEME.md`). Este documento parte de esas tablas.
+
+**Término de esfuerzo.** Usamos *horas-detector*: una hora-detector es un detector grabando durante una hora. Si 30 detectores graban una hora completa, suman 30 horas-detector.
+
+# Configuración
+
+Cargamos los paquetes y las funciones auxiliares, y fijamos la semilla de los números aleatorios para que el bootstrap dé siempre el mismo resultado.
+
+```{r configuracion}
+paquetes <- c("dplyr", "tidyr", "readr", "ggplot2", "patchwork", "scales", "sf", "units", "here", "knitr")
+# opcionales, mejoran la tipografía de las figuras: install.packages(c("ragg", "systemfonts"))
+faltan <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltan) > 0) stop("Instala primero: install.packages(c('", paste(faltan, collapse = "', '"), "'))")
+
+library(dplyr); library(tidyr); library(ggplot2); library(patchwork); library(sf); library(here)
+source(here("R", "funciones.R"))
+# figuras en el documento: ragg da mejor tipografía y antialiasing si está instalado
+knitr::opts_chunk$set(dev = if (requireNamespace("ragg", quietly = TRUE)) "ragg_png" else "png", dpi = 150)
+
+set.seed(20261020)
+B <- params$B
+dir.create(here("resultados", "tablas"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("resultados", "figuras"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("datos", "procesados"), showWarnings = FALSE, recursive = TRUE)
+```
+
+# Datos
+
+## Lectura
+
+El estudio usa los cruceros de mayo de 2023, 2024 y 2026. La única excepción es el Análisis 2: los reportes de mayo no publican el esfuerzo de cada estación, así que para validar el núcleo de actividad usamos dos conjuntos independientes que sí lo publican, los muestreos de julio a diciembre de 2022 y el monitoreo de agosto y septiembre de 2024. El muestreo de abril de 2022 (muestreo 0) se excluye.
+
+```{r lectura}
+MUESTREOS_EXCLUIDOS_2022 <- c(0)
+
+crudos <- function(...) here("datos", "crudos", ...)
+enc_mayo <- leer_csv(crudos("encuentros_mayo_2023_2024_2026.csv")) |>
+  mutate(t = a_fecha(inicio), ztc = estación <= 55)
+periodos_mayo <- leer_csv(crudos("periodos_esfuerzo_mayo.csv"))
+esf22 <- leer_csv(crudos("esfuerzo_2022.csv")) |> filter(!muestreo %in% MUESTREOS_EXCLUIDOS_2022)
+ago_sep24 <- leer_csv(crudos("estaciones_ago_sep_2024.csv"))
+coords <- leer_csv(crudos("estaciones_red_ZTC_coordenadas.csv"))
+
+# polígonos del Acuerdo de 2026 (se usan en los mapas y en el Análisis 3)
+pol_ll <- leer_csv(here("datos", "externos", "poligonos_dof_2026.csv")) |>
+  group_by(poligono) |> arrange(orden, .by_group = TRUE) |>
+  summarise(geometry = st_sfc(st_polygon(list(rbind(cbind(longitud, latitud), cbind(longitud, latitud)[1, ]))), crs = 4326)) |>
+  st_as_sf()
+```
+
+## Verificación
+
+Antes de analizar, comprobamos que el número de encuentros coincide con lo que informa cada reporte. Las diferencias conocidas están documentadas en la base de datos original.
+
+```{r verificacion}
+tibble::tribble(
+  ~conjunto, ~encuentros_en_la_base, ~informados, ~nota,
+  "Mayo 2023", sum(enc_mayo$año == 2023), 61, "la tabla del apéndice tiene 60; un encuentro aparece duplicado en los reportes diarios",
+  "Mayo 2024", sum(enc_mayo$año == 2024), 70, "dos encuentros se describen solo en texto, sin hora",
+  "Mayo 2026", sum(enc_mayo$año == 2026), 72, "16 en estaciones fuera de la ATC",
+  "Julio a diciembre 2022 (validación)", sum(esf22$encuentros), NA, "se excluye el muestreo de abril",
+  "Agosto y septiembre 2024 (validación)", sum(ago_sep24$encuentros), 54, "solo totales por estación"
+)
+```
+
+# Variables temporales y de marea
+
+## Periodo del día
+
+Para cada momento calculamos la salida y la puesta del sol con el algoritmo de la NOAA (31.02° N, 114.84° O). El crepúsculo es la hora antes y después de la salida o la puesta; el día y la noche son el resto. En mayo la hora local es UTC−7.
+
+```{r ejemplo-sol}
+s <- sol(a_fecha("2023-05-15 12:00"), tz = -7)
+data.frame(fecha = "15 de mayo de 2023", salida = round(s$sale, 2), puesta = round(s$pone, 2),
+           horas_de_luz = round(s$pone - s$sale, 1))
+```
+
+## Marea
+
+Las tablas de CICESE solo dan la hora y la altura de cada pleamar y bajamar, medidas desde la Bajamar Media Inferior (BMI), el cero de la tabla. Con ellas calculamos:
+
+- **Fase:** repunte si falta o pasó 1 h o menos desde un extremo; creciente si el siguiente extremo es una pleamar; decreciente si es una bajamar.
+- **Altura y velocidad vertical:** entre dos extremos suponemos media onda de coseno, $h(t) = h_1 + (h_2 - h_1)\,[1-\cos(\pi f)]/2$, con $f$ la fracción del intervalo transcurrida; la velocidad es su derivada. Solo las usamos para describir la marea; el modelo usa la fase.
+
+```{r mareas}
+archivos_mareas <- list.files(crudos("mareas"), pattern = "_(2023|2024|2026)_05\\.csv$", full.names = TRUE)
+M_mayo <- preparar_mareas(archivos_mareas)
+```
+
+La figura siguiente muestra un día de ejemplo: los puntos grandes son los extremos publicados y la curva es la interpolación.
+
+```{r fig-marea-ejemplo, fig.height=3}
+dia <- seq(a_fecha("2023-05-12 00:00"), a_fecha("2023-05-13 00:00"), by = 600)
+ejemplo <- bind_cols(t = dia, marea_en(dia, M_mayo)) |>
+  mutate(fase_marea = factor(fase_marea, names(COL_FASE)), tramo = cumsum(fase_marea != lag(fase_marea, default = first(fase_marea))))
+extremos <- filter(M_mayo$ext, t >= min(dia), t <= max(dia))
+ggplot(ejemplo, aes(t, altura_est_cm)) +
+  geom_line(aes(colour = fase_marea, group = tramo), linewidth = 1.3, lineend = "round") +
+  geom_point(data = extremos, aes(t, h), size = 2.6, colour = TINTA, fill = "white", shape = 21, stroke = 1) +
+  geom_text(data = extremos, aes(t, h, label = paste0(round(h), " cm")), vjust = ifelse(extremos$tipo == "pleamar", -1, 1.9),
+            size = 2.8, family = FUENTE, colour = TINTA2) +
+  scale_colour_manual(values = COL_FASE, labels = c("Creciente", "Repunte", "Decreciente"), name = NULL) +
+  scale_x_datetime(date_labels = "%H:%M", breaks = seq(min(dia), max(dia), by = "3 hours")) +
+  scale_y_continuous(expand = expansion(mult = 0.18)) +
+  labs(title = "Marea interpolada en San Felipe", subtitle = "12 de mayo de 2023; los círculos son las pleamares y bajamares publicadas por CICESE",
+       x = "Hora local", y = "Altura sobre la BMI (cm)") +
+  tema_vaquita()
+```
+
+# Esfuerzo acústico por hora
+
+Los reportes de mayo publican periodos de recambio de los detectores, con su inicio, su fin y el número de detectores con datos. Repartimos cada periodo en pasos de 10 minutos y sumamos las horas-detector de cada hora. Cuando el reporte indica una recuperación escalonada en las últimas 48 h, el número de detectores baja linealmente en ese tramo. En 2026 la red incluyó estaciones fuera de la ATC; aproximamos el esfuerzo dentro de la ATC con la fracción de días de esfuerzo en la zona (422.63 de 674.91).
+
+```{r esfuerzo-mayo}
+FRAC_ZTC <- c("2023" = 1, "2024" = 1, "2026" = 422.63 / 674.91)
+REPORTADO_DIAS <- c("2023" = 371.57, "2024" = 549.12, "2026" = 674.91)
+
+pasos_mayo <- bind_rows(lapply(seq_len(nrow(periodos_mayo)), function(i) {
+  r <- periodos_mayo[i, ]; a <- a_fecha(r$inicio); b <- a_fecha(r$fin)
+  p <- pasos_10min(a, b)
+  rampa <- if (r$tipo_fin == "rampa_48h") ifelse(p$paso > b - 48 * 3600,
+             as.numeric(difftime(b, p$paso, units = "secs")) / (48 * 3600), 1) else 1
+  mutate(p, año = r$año, hd = r$detectores_con_datos * r$factor_esfuerzo * rampa * dur_h)
+}))
+
+horario_mayo <- pasos_mayo |>
+  group_by(año, hora) |>
+  summarise(horas_detector = sum(hd), .groups = "drop") |>
+  mutate(horas_detector_ZTC = horas_detector * FRAC_ZTC[as.character(año)])
+mitad <- horario_mayo$hora + 1800                       # variables evaluadas a la mitad de la hora
+horario_mayo <- bind_cols(horario_mayo, periodo_dia = periodo_dia(mitad, -7), marea_en(mitad, M_mayo))
+
+# encuentros: cada uno se asigna a la hora en que empezó
+cuenta <- enc_mayo |> mutate(hora = as.POSIXct(trunc(t, "hours"))) |>
+  group_by(hora) |> summarise(encuentros = n(), encuentros_ZTC = sum(ztc), .groups = "drop")
+horario_mayo <- horario_mayo |> left_join(cuenta, by = "hora") |>
+  mutate(across(c(encuentros, encuentros_ZTC), ~ coalesce(.x, 0L)), dia = paste(año, as.Date(hora)))
+
+stopifnot(sum(horario_mayo$encuentros) == nrow(enc_mayo))   # ningún encuentro quedó fuera del esfuerzo
+readr::write_csv(horario_mayo, here("datos", "procesados", "esfuerzo_horario_mayo.csv"))
+
+horario_mayo |> group_by(año) |>
+  summarise(dias_detector = sum(horas_detector) / 24, encuentros_ZTC = sum(encuentros_ZTC)) |>
+  mutate(reportado_dias = REPORTADO_DIAS[as.character(año)],
+         cobertura_pct = round(100 * dias_detector / reportado_dias), dias_detector = round(dias_detector, 1))
+```
+
+# Análisis 1. Periodo del día y marea
+
+## Tasas observadas
+
+La tasa es el número de encuentros por cada 100 horas-detector, con intervalo exacto de Garwood. Solo usamos la ATC.
+
+```{r tasas}
+Hm <- filter(horario_mayo, horas_detector_ZTC > 0) |>
+  mutate(año = factor(año), periodo_dia = factor(periodo_dia, c("día", "crepuscular", "noche")),
+         fase_marea = factor(fase_marea, c("creciente", "repunte", "decreciente")))
+
+tasas <- bind_rows(lapply(c("periodo_dia", "fase_marea"), function(v) {
+  bind_rows(Hm |> mutate(grupo = as.character(año)), Hm |> mutate(grupo = "Tres años")) |>
+    group_by(variable = v, grupo, categoria = .data[[v]]) |>
+    summarise(k = sum(encuentros_ZTC), e = sum(horas_detector_ZTC), .groups = "drop") |>
+    (\(d) bind_cols(d, garwood(d$k, d$e)))()
+}))
+guardar_tabla(tasas, "tasas_por_categoria")
+tasas |> filter(grupo == "Tres años") |> mutate(across(c(tasa, ic95_inf, ic95_sup), ~ round(.x, 2)))
+```
+
+```{r fig4, fig.height=4, fig.cap="Figura 4. Tasas de encuentros por periodo del día y por fase de marea en mayo. Los puntos de color son cada crucero y los puntos negros, los tres años combinados (IC 95% de Garwood)."}
+etiquetas <- c(día = "Día", crepuscular = "Crepúsculo", noche = "Noche",
+               creciente = "Creciente", repunte = "Repunte", decreciente = "Decreciente")
+d4 <- tasas |>
+  mutate(variable = factor(variable, c("periodo_dia", "fase_marea"), c("Periodo del día", "Fase de marea")),
+         categoria = factor(categoria, names(etiquetas), etiquetas))
+fig4 <- ggplot(mapping = aes(categoria, tasa)) +
+  geom_pointrange(data = filter(d4, grupo != "Tres años"), aes(ymin = ic95_inf, ymax = ic95_sup, colour = grupo),
+                  position = position_dodge(0.55), size = 0.25, linewidth = 0.5, alpha = 0.55) +
+  geom_pointrange(data = filter(d4, grupo == "Tres años"), aes(ymin = ic95_inf, ymax = ic95_sup),
+                  colour = TINTA, size = 0.55, linewidth = 1.1) +
+  geom_text(data = filter(d4, grupo == "Tres años"), aes(label = sprintf("%.2f", tasa)),
+            nudge_x = 0.36, size = 3, family = FUENTE, fontface = "bold", colour = TINTA) +
+  facet_wrap(~variable, scales = "free_x") +
+  scale_colour_manual(values = PALETA, name = "Crucero de mayo") +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "La actividad acústica es mayor de noche y menor con marea creciente",
+       subtitle = "Encuentros por 100 horas-detector en la ATC, mayo de 2023, 2024 y 2026",
+       x = NULL, y = "Encuentros por 100 horas-detector") +
+  tema_vaquita()
+guardar_figura(fig4, "fig4_tasas_periodo_marea", alto = 4); fig4
+```
+
+## El modelo
+
+El número de encuentros en cada hora se modela con una distribución de Poisson, y el logaritmo de las horas-detector entra como compensación (*offset*), de modo que el modelo compara tasas y no conteos:
+
+$$\log \mu_h = \log E_h + \beta_0 + \beta_{\text{año}} + \beta_{\text{periodo}} + \beta_{\text{fase}}$$
+
+Si pasamos $\log E_h$ al lado izquierdo queda $\log(\mu_h / E_h)$: lo que se modela es la tasa por hora-detector. Por eso cada coeficiente exponenciado es una **razón de tasas** respecto a la categoría de referencia (2023, día y marea creciente).
+
+```{r glm-mayo}
+m_principal <- glm(encuentros_ZTC ~ año + periodo_dia + fase_marea + offset(log(horas_detector_ZTC)),
+                   family = poisson, data = Hm)
+summary(m_principal)$coefficients |> round(3)
+c(sobredispersion = sum(residuals(m_principal, "pearson")^2) / df.residual(m_principal))
+```
+
+La sobredispersión (Pearson/gl) cercana a 1 indica que la distribución de Poisson describe bien la variación hora a hora.
+
+## Pruebas de razón de verosimilitud
+
+Comparamos el modelo con y sin cada variable. `drop1` hace esa comparación para todas a la vez.
+
+```{r lrt-mayo}
+lrt <- drop1(m_principal, test = "LRT") |> as.data.frame() |> tibble::rownames_to_column("variable") |>
+  filter(variable != "<none>") |> transmute(variable, gl = Df, LRT = round(LRT, 2), p = signif(`Pr(>Chi)`, 3))
+guardar_tabla(lrt, "lrt_mayo"); lrt
+```
+
+## Intervalos por bootstrap de días
+
+Los encuentros de un mismo día no son independientes. Por eso remuestreamos días completos dentro de cada año, reajustamos el modelo `B` veces y tomamos los percentiles 2.5 y 97.5 de cada razón de tasas.
+
+```{r bootstrap-mayo}
+X <- model.matrix(m_principal); y <- Hm$encuentros_ZTC; off <- log(Hm$horas_detector_ZTC)
+bs <- bootstrap_dias(X, y, off, dia = Hm$dia, estrato = Hm$año, B = B)
+
+rr_mayo <- tibble::tibble(termino = colnames(X), b = coef(m_principal),
+                          inf = apply(bs, 2, quantile, 0.025), sup = apply(bs, 2, quantile, 0.975)) |>
+  filter(termino != "(Intercept)") |>
+  mutate(RR = exp(b), ic95_inf = exp(inf), ic95_sup = exp(sup),
+         contraste = recode(termino, año2024 = "2024 frente a 2023", año2026 = "2026 frente a 2023",
+                            periodo_diacrepuscular = "Crepúsculo frente a día", periodo_dianoche = "Noche frente a día",
+                            fase_mareadecreciente = "Decreciente frente a creciente", fase_marearepunte = "Repunte frente a creciente")) |>
+  select(contraste, RR, ic95_inf, ic95_sup)
+guardar_tabla(rr_mayo, "cuadro1_razones_de_tasas_mayo")
+rr_mayo |> mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+```{r fig5, fig.height=3.8, fig.cap="Figura 5. Razones de tasas del modelo principal de mayo con IC 95% por bootstrap de días (escala logarítmica). En color, los contrastes cuyo intervalo no incluye el 1."}
+grupos <- c("Noche frente a día" = "Periodo del día", "Crepúsculo frente a día" = "Periodo del día",
+            "Decreciente frente a creciente" = "Fase de marea", "Repunte frente a creciente" = "Fase de marea",
+            "2024 frente a 2023" = "Año", "2026 frente a 2023" = "Año")
+d5 <- rr_mayo |>
+  mutate(grupo = factor(grupos[contraste], c("Periodo del día", "Fase de marea", "Año")),
+         contraste = factor(contraste, rev(names(grupos))),
+         claro = ic95_inf > 1 | ic95_sup < 1,
+         etiqueta = fmt_ic(RR, ic95_inf, ic95_sup))
+fig5 <- ggplot(d5, aes(RR, contraste)) +
+  geom_vline(xintercept = 1, colour = TINTA2, linewidth = 0.4) +
+  geom_linerange(aes(xmin = ic95_inf, xmax = ic95_sup, colour = claro), linewidth = 1.6, lineend = "round") +
+  geom_point(aes(colour = claro), size = 3.2, shape = 21, fill = "white", stroke = 1.4) +
+  geom_text(aes(x = 3.9, label = etiqueta), hjust = 0, family = FUENTE, size = 3, colour = TINTA) +
+  facet_grid(grupo ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  scale_colour_manual(values = c(`TRUE` = ACENTO, `FALSE` = "#9fa9b5"), guide = "none") +
+  scale_x_log10(breaks = c(0.5, 1, 2, 3), labels = c("0.5", "1", "2", "3"), limits = c(0.3, 11)) +
+  labs(title = "Razones de tasas del modelo de mayo", subtitle = "Respecto a día, marea creciente y 2023; IC 95% por bootstrap de días",
+       x = "Razón de tasas (escala logarítmica)", y = NULL) +
+  tema_vaquita() +
+  theme(strip.placement = "outside", strip.text.y.left = element_text(angle = 0, face = "bold", hjust = 1, colour = TINTA2),
+        panel.grid.major.y = element_blank(), panel.grid.major.x = element_line(colour = REJILLA, linewidth = 0.4))
+guardar_figura(fig5, "fig5_razones_de_tasas", alto = 3.8); fig5
+```
+
+## Consistencia entre años
+
+Si el patrón es real, debería aparecer en cada crucero por separado. Calculamos las razones noche/día y decreciente/creciente de cada año (Cuadro 2).
+
+```{r consistencia}
+por_año <- bind_rows(lapply(c("2023", "2024", "2026"), function(a) {
+  d <- filter(Hm, año == a)
+  tibble::tibble(año = a, noche_dia = razon_cruda(d, "periodo_dia", "noche", "día"),
+                 decreciente_creciente = razon_cruda(d, "fase_marea", "decreciente", "creciente"))
+}))
+guardar_tabla(por_año, "cuadro2_razones_por_año")
+por_año |> mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+## Prueba del supuesto de la compensación
+
+El *offset* supone que, si se duplican las horas-detector, se duplican los encuentros esperados (coeficiente fijo en 1). Para comprobarlo, metemos el logaritmo del esfuerzo como covariable y vemos si su coeficiente es compatible con 1 y si las razones de tasas cambian.
+
+```{r prueba-offset}
+Hm$log_E <- log(Hm$horas_detector_ZTC)
+m_libre <- glm(encuentros_ZTC ~ año + periodo_dia + fase_marea + log_E, family = poisson, data = Hm)
+dias_m <- split(unique(Hm$dia), Hm$año[match(unique(Hm$dia), Hm$dia)]); filas_m <- split(seq_len(nrow(Hm)), Hm$dia)
+b_E <- replicate(B, {
+  idx <- unlist(lapply(dias_m, function(z) unlist(filas_m[sample(z, length(z), replace = TRUE)], use.names = FALSE)))
+  coef(glm(encuentros_ZTC ~ año + periodo_dia + fase_marea + log_E, family = poisson, data = Hm[idx, ]))[["log_E"]]
+})
+list(coeficiente_log_esfuerzo = round(coef(m_libre)[["log_E"]], 2),
+     IC95_bootstrap_dias = round(quantile(b_E, c(0.025, 0.975), na.rm = TRUE), 2),
+     RR_con_offset = round(exp(coef(m_principal)[c("periodo_dianoche", "fase_mareadecreciente")]), 2),
+     RR_coeficiente_libre = round(exp(coef(m_libre)[c("periodo_dianoche", "fase_mareadecreciente")]), 2))
+```
+
+# Análisis 2. Núcleo de actividad
+
+## Encuentros por estación en mayo
+
+Definimos el núcleo como las cinco estaciones de la ATC con más encuentros en los tres cruceros de mayo.
+
+```{r nucleo}
+por_estacion_mayo <- enc_mayo |> filter(ztc) |> count(estación, name = "encuentros") |> arrange(desc(encuentros))
+NUCLEO <- sort(head(por_estacion_mayo$estación, 5))
+cat("Núcleo de mayo:", NUCLEO, "\n")
+c(encuentros_mayo_ATC = sum(por_estacion_mayo$encuentros),
+  encuentros_en_nucleo = sum(por_estacion_mayo$encuentros[por_estacion_mayo$estación %in% NUCLEO]),
+  pct_en_nucleo = round(100 * mean(enc_mayo$estación[enc_mayo$ztc] %in% NUCLEO), 1))
+```
+
+```{r fig6, fig.height=6.2, fig.width=6.6, fig.cap="Figura 6. Encuentros por estación en los cruceros de mayo (2023, 2024 y 2026 combinados). El tamaño del círculo es proporcional al número de encuentros y los anillos negros marcan el núcleo. Fondo: ATC (blanco), Área de Aprovechamiento Especial (naranja) y Canal de Tránsito (verde)."}
+mapa_mayo <- coords |> left_join(por_estacion_mayo, by = "estación") |> mutate(encuentros = coalesce(encuentros, 0L))
+fig6 <- ggplot() +
+  capas_base(pol_ll) +
+  geom_point(data = filter(mapa_mayo, encuentros == 0), aes(longitud, latitud), colour = "#b9c3cf", size = 1.1) +
+  geom_point(data = filter(mapa_mayo, encuentros > 0), aes(longitud, latitud, size = encuentros),
+             shape = 21, fill = PALETA[["2023"]], colour = "white", alpha = 0.9, stroke = 0.5) +
+  geom_point(data = filter(mapa_mayo, estación %in% NUCLEO), aes(longitud, latitud, size = encuentros),
+             shape = 21, fill = NA, colour = TINTA, stroke = 0.9, show.legend = FALSE) +
+  geom_text(data = filter(mapa_mayo, estación %in% NUCLEO), aes(longitud, latitud, label = estación),
+            nudge_x = 0.017, nudge_y = 0.009, size = 3, family = FUENTE, fontface = "bold", colour = TINTA) +
+  scale_size_area(max_size = 11, name = "Encuentros") +
+  encuadre_red(pol_ll) +
+  labs(title = "Dónde se registraron los encuentros de mayo", subtitle = "Tres cruceros combinados; en negro, las cinco estaciones del núcleo") +
+  tema_mapa()
+guardar_figura(fig6, "fig6_encuentros_mayo_por_estacion", ancho = 6.6, alto = 6.2); fig6
+```
+
+## Validación con datos independientes
+
+Comparamos la tasa del núcleo con la del resto de las estaciones en los dos conjuntos que reportan esfuerzo por estación y que no se usaron para definir el núcleo. La razón de tasas lleva un intervalo exacto (binomial condicional).
+
+```{r validacion-nucleo}
+por_estacion <- list(
+  "Julio a diciembre de 2022" = esf22 |> filter(estación <= 55) |> group_by(estación) |>
+    summarise(E = sum(esfuerzo_h) / 24, n = sum(encuentros)),
+  "Agosto a septiembre de 2024" = ago_sep24 |> transmute(estación, E = esfuerzo_días, n = encuentros))
+
+validacion <- bind_rows(lapply(names(por_estacion), function(nm) {
+  d <- por_estacion[[nm]]; nuc <- d$estación %in% NUCLEO
+  rr <- rr_exacto(sum(d$n[nuc]), sum(d$E[nuc]), sum(d$n[!nuc]), sum(d$E[!nuc]))
+  tibble::tibble(conjunto = nm, estaciones = nrow(d), encuentros = sum(d$n),
+                 RR = rr[["rr"]], ic95_inf = rr[["inf"]], ic95_sup = rr[["sup"]])
+}))
+guardar_tabla(validacion, "cuadro3_validacion_nucleo")
+validacion |> mutate(across(c(RR, ic95_inf, ic95_sup), ~ round(.x, 2)))
+```
+
+Para 2022 comprobamos que el resultado no dependa de un solo muestreo: repetimos el cálculo excluyendo un muestreo a la vez.
+
+```{r robustez-nucleo}
+rr_2022 <- function(e) {
+  d <- e |> filter(estación <= 55) |> group_by(estación) |> summarise(E = sum(esfuerzo_h), n = sum(encuentros))
+  nuc <- d$estación %in% NUCLEO
+  (sum(d$n[nuc]) / sum(d$E[nuc])) / (sum(d$n[!nuc]) / sum(d$E[!nuc]))
+}
+muestreos <- sort(unique(esf22$muestreo))
+sin_uno <- sapply(muestreos, function(m) rr_2022(filter(esf22, muestreo != m)))
+names(sin_uno) <- paste("sin muestreo", muestreos)
+round(sin_uno, 2)
+```
+
+## Perspectivas: probabilidad de detección por estación
+
+Esta sección no forma parte de los tres análisis principales; alimenta la sección de Perspectivas del extenso. Como algunas estaciones tienen muy poco esfuerzo, sus tasas individuales son inestables. Por eso las suavizamos con un modelo gamma-Poisson (Bayes empírico): las tasas de las estaciones siguen una distribución gamma cuyos parámetros (forma $k$ y media $\mu$) se estiman con todas las estaciones a la vez, por máxima verosimilitud de la binomial negativa. Con la distribución posterior de cada estación calculamos la probabilidad de registrar al menos un encuentro en 24 y en 48 h. Usamos los dos conjuntos con esfuerzo por estación (2022 y agosto a septiembre de 2024).
+
+```{r probabilidad}
+est <- bind_rows(por_estacion) |> group_by(estación) |> summarise(E = sum(E), n = sum(n))
+nll <- function(p) { k <- exp(p[1]); mu <- exp(p[2])
+  -sum(lgamma(est$n + k) - lgamma(k) - lgamma(est$n + 1) + k * log(k / (k + mu * est$E)) + est$n * log(mu * est$E / (k + mu * est$E))) }
+ajuste <- optim(c(0, log(sum(est$n) / sum(est$E))), nll, method = "Nelder-Mead", control = list(reltol = 1e-12, maxit = 5000))
+k <- exp(ajuste$par[1]); mu <- exp(ajuste$par[2])
+cat(sprintf("k = %.3f, mu = %.4f encuentros/día, %d estaciones\n", k, mu, nrow(est)))
+
+prob <- est |> mutate(a = k + n, b = k / mu + E,
+                      P_24h = 1 - (b / (b + 1))^a, P_48h = 1 - (b / (b + 2))^a,
+                      P_48h_inf = 1 - exp(-qgamma(0.025, a, b) * 2), P_48h_sup = 1 - exp(-qgamma(0.975, a, b) * 2)) |>
+  left_join(coords, by = "estación") |> arrange(desc(P_48h)) |> mutate(rango = row_number())
+guardar_tabla(prob, "probabilidad_deteccion_estaciones")
+prob |> select(rango, estación, E, n, P_24h, P_48h, P_48h_inf, P_48h_sup) |> head(10) |> mutate(across(where(is.double), ~ round(.x, 3)))
+```
+
+En el mapa, cada símbolo lleva escrito el porcentaje de probabilidad de esa estación y, en gris pequeño junto a él, el número de la estación; el color refuerza el mismo valor. Las estaciones sin esfuerzo medido aparecen como círculos vacíos.
+
+```{r fig8, fig.height=6.4, fig.width=10.5, fig.cap="Figura 8. Probabilidad de al menos un encuentro acústico en 48 h por estación: (a) mapa, con el porcentaje escrito en cada estación y su número en gris; los anillos negros marcan el núcleo de mayo; (b) las 15 estaciones con mayor probabilidad, con intervalos de credibilidad al 95%."}
+prob_mapa <- prob |> mutate(pct = round(100 * P_48h), texto_claro = P_48h >= 0.35)   # texto blanco sobre azules oscuros
+p8a <- ggplot() +
+  capas_base(pol_ll) +
+  geom_point(data = anti_join(coords, prob, by = "estación"), aes(longitud, latitud), shape = 1, size = 2.2, colour = "#9fa9b5") +
+  geom_point(data = prob_mapa, aes(longitud, latitud, fill = P_48h), shape = 21, size = 7.2, colour = "white", stroke = 0.5) +
+  geom_point(data = filter(prob_mapa, estación %in% NUCLEO), aes(longitud, latitud), shape = 21, size = 8.8, stroke = 0.9, colour = TINTA, fill = NA) +
+  geom_text(data = prob_mapa, aes(longitud, latitud, label = pct, colour = texto_claro), size = 2.5, family = FUENTE, fontface = "bold") +
+  geom_text(data = prob_mapa, aes(longitud, latitud, label = estación), nudge_x = 0.0095, nudge_y = 0.0078, size = 2, family = FUENTE, colour = TINTA2) +
+  scale_fill_gradientn(colours = c("#e3edfa", "#6fa3e6", "#2a78d6", ACENTO), limits = c(0, 0.75),
+                       labels = scales::label_percent(), name = "P(48 h)") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = TINTA), guide = "none") +
+  encuadre_red(pol_ll) +
+  labs(title = "a. Probabilidad de detección en 48 h (%)") +
+  tema_mapa() + theme(legend.key.height = unit(1.4, "cm"), legend.key.width = unit(0.3, "cm"))
+p8b <- prob |> slice_head(n = 15) |>
+  mutate(etq = factor(paste("Estación", estación), rev(paste("Estación", estación))), nucleo = estación %in% NUCLEO) |>
+  ggplot(aes(P_48h, etq)) +
+  geom_linerange(aes(xmin = P_48h_inf, xmax = P_48h_sup), colour = "#c3d5ee", linewidth = 2.2, lineend = "round") +
+  geom_point(aes(fill = nucleo), shape = 21, size = 2.6, colour = "white", stroke = 0.6) +
+  geom_text(aes(x = P_48h_sup, label = paste0(round(100 * P_48h), "%")), hjust = -0.25, size = 2.7, family = FUENTE, colour = TINTA) +
+  scale_fill_manual(values = c(`TRUE` = ACENTO, `FALSE` = "#2a78d6"), labels = c(`TRUE` = "Núcleo de mayo", `FALSE` = "Otras"), name = NULL) +
+  scale_x_continuous(limits = c(0, 1.08), breaks = seq(0, 1, 0.25), labels = scales::label_percent()) +
+  labs(title = "b. Estaciones con mayor probabilidad", x = "Probabilidad (intervalo de credibilidad al 95%)", y = NULL) +
+  tema_vaquita(9) + theme(panel.grid.major.y = element_blank(), panel.grid.major.x = element_line(colour = REJILLA, linewidth = 0.4))
+fig8 <- p8a + p8b + plot_layout(widths = c(1.25, 1))
+guardar_figura(fig8, "fig8_probabilidad_deteccion_48h", ancho = 10.5, alto = 6.4); fig8
+```
+
+# Análisis 3. Comparación con el Acuerdo de 2026
+
+## Polígonos y estaciones
+
+Cruzamos las estaciones con los polígonos del Acuerdo publicado en el DOF el 14 de octubre de 2026. Trabajamos en UTM 11N (EPSG:32611), en metros. Las estaciones del borde de la ATC quedan a pocos metros del límite por efecto de la proyección, por lo que usamos una tolerancia de 25 m.
+
+```{r poligonos}
+pol <- st_transform(pol_ll, 32611)
+P <- setNames(split(pol, pol$poligono), pol$poligono)
+
+est_sf <- st_as_sf(coords, coords = c("longitud", "latitud"), crs = 4326, remove = FALSE) |> st_transform(32611)
+TOL <- 25
+dist_km <- function(a, b) as.numeric(st_distance(a, b)) / 1000
+estaciones_dof <- est_sf |> mutate(
+  dentro_ATC = dist_km(geometry, P$ZTC) * 1000 < TOL,
+  colinda_especial = dist_km(geometry, P$aprovechamiento_especial) * 1000 < TOL,
+  distancia_canal_km = dist_km(geometry, P$canal_tránsito),
+  nucleo = estación %in% NUCLEO) |>
+  st_drop_geometry()
+guardar_tabla(estaciones_dof, "estaciones_poligonos_dof")
+
+c(estaciones_en_ATC = sum(estaciones_dof$dentro_ATC), colindan_area_especial = sum(estaciones_dof$colinda_especial),
+  pct_encuentros_mayo_en_borde_especial = round(100 * mean(enc_mayo$estación[enc_mayo$ztc] %in%
+                                                             estaciones_dof$estación[estaciones_dof$colinda_especial]), 1))
+estaciones_dof |> filter(nucleo) |> select(estación, colinda_especial, distancia_canal_km) |>
+  mutate(distancia_canal_km = round(distancia_canal_km, 2))
+```
+
+## Área de la ATC
+
+El encabezado del Cuadro 3 del Acuerdo declara 225 km². Calculamos el área con los vértices, la longitud de los lados y los ángulos internos, para entender la diferencia.
+
+```{r area-atc}
+atc <- P$ZTC
+v <- st_coordinates(atc)[1:4, c("X", "Y")]                 # vértices en UTM (m)
+lados_km <- sqrt(rowSums((v[c(2:4, 1), ] - v)^2)) / 1000
+angulo <- function(p, q, r) { u <- p - q; w <- r - q; acos(sum(u * w) / sqrt(sum(u^2) * sum(w^2))) * 180 / pi }
+angulos <- sapply(1:4, function(i) angulo(v[c(4, 1:3)[i], ], v[i, ], v[c(2:4, 1)[i], ]))
+list(area_km2_UTM = round(as.numeric(st_area(atc)) / 1e6, 1),
+     area_km2_geodesica = round(as.numeric(st_area(st_transform(atc, 4326))) / 1e6, 1),
+     lados_km = round(lados_km, 2), angulos_grados = round(angulos, 1),
+     producto_de_lados_km2 = round(lados_km[1] * lados_km[2], 1))
+```
+
+## Franjas horarias del Acuerdo
+
+Dividimos el día en las franjas del Acuerdo: 05:00 a 16:00 h (pesca permitida antes y ahora), 16:00 a 19:00 h (antes en veda, ahora permitida) y 19:00 a 05:00 h (veda nocturna vigente). Para cada franja calculamos el porcentaje de encuentros y de esfuerzo de mayo, y comparamos su tasa con la de 05:00 a 16:00 h con el mismo bootstrap de días.
+
+```{r franjas}
+Hm <- Hm |> mutate(franja = cut(as.numeric(format(hora, "%H")), c(-1, 4, 15, 18, 23), c("19-05", "05-16", "16-19", "19-05")))
+reparto <- Hm |> group_by(franja) |>
+  summarise(pct_encuentros = 100 * sum(encuentros_ZTC) / sum(Hm$encuentros_ZTC),
+            pct_esfuerzo = 100 * sum(horas_detector_ZTC) / sum(Hm$horas_detector_ZTC))
+
+contr <- list(c("16-19", "05-16"), c("19-05", "05-16"), c("19-05", "16-19"))
+dias_todos <- unique(Hm$dia)
+boot_franjas <- replicate(B, {
+  d <- Hm[unlist(filas_m[sample(dias_todos, length(dias_todos), replace = TRUE)]), ]
+  vapply(contr, function(cc) razon_cruda(d, "franja", cc[1], cc[2]), numeric(1))
+})
+franjas <- tibble::tibble(contraste = vapply(contr, function(cc) paste(cc[1], "frente a", cc[2]), ""),
+                          RR = vapply(contr, function(cc) razon_cruda(Hm, "franja", cc[1], cc[2]), 0),
+                          ic95_inf = apply(boot_franjas, 1, quantile, 0.025, na.rm = TRUE),
+                          ic95_sup = apply(boot_franjas, 1, quantile, 0.975, na.rm = TRUE))
+franja_por_año <- sapply(c("2023", "2024", "2026"), function(a) razon_cruda(filter(Hm, año == a), "franja", "16-19", "05-16"))
+guardar_tabla(franjas, "franjas_acuerdo")
+list(reparto = reparto |> mutate(across(where(is.numeric), ~ round(.x, 1))),
+     razones = franjas |> mutate(across(where(is.numeric), ~ round(.x, 2))),
+     franja_16_19_por_año = round(franja_por_año, 2))
+```
+
+## Mapa
+
+```{r fig7, fig.height=6, fig.width=6.8, fig.cap="Figura 7. Polígonos del Acuerdo de 2026, estaciones de la red (los anillos negros marcan el núcleo de mayo) y avistamientos de 2026 (triángulos)."}
+av26 <- leer_csv(here("datos", "externos", "avistamientos_2026_coordenadas.csv")) |>
+  st_as_sf(coords = c("longitud", "latitud"), crs = 4326)
+zonas <- pol_ll |> mutate(zona = factor(poligono, c("prohibición_enmalle", "aprovechamiento_especial", "ZTC", "canal_tránsito"),
+                                        c("Prohibición de redes de enmalle", "Aprovechamiento especial", "Tolerancia cero (ATC)", "Canal de tránsito"))) |>
+  arrange(zona)
+fig7 <- ggplot() +
+  geom_sf(data = zonas, aes(fill = zona), colour = "#8d99a8", linewidth = 0.35) +
+  geom_point(data = estaciones_dof, aes(longitud, latitud), colour = TINTA2, size = 0.9) +
+  geom_point(data = filter(estaciones_dof, nucleo), aes(longitud, latitud), shape = 21, size = 3.6, stroke = 0.9, colour = TINTA, fill = NA) +
+  geom_sf(data = av26, shape = 24, size = 3, fill = "#eb6834", colour = TINTA, stroke = 0.6) +
+  scale_fill_manual(values = c("#d5e3f3", "#f6c9ae", "white", "#1baf7a"), name = NULL) +
+  coord_sf(xlim = c(-114.86, -114.39), ylim = c(30.88, 31.39), crs = 4326, expand = FALSE) +
+  labs(title = "Polígonos del Acuerdo de 2026 y red acústica",
+       subtitle = "Puntos: estaciones; anillos: núcleo de mayo; triángulos: avistamientos de 2026") +
+  tema_mapa() + theme(legend.position = "bottom", legend.justification = "left") +
+  guides(fill = guide_legend(nrow = 2))
+guardar_figura(fig7, "fig7_poligonos_dof_2026", ancho = 6.8, alto = 6.6); fig7
+```
+
+# Registro de la sesión
+
+Para que el análisis sea reproducible, guardamos las versiones de R y de los paquetes con que se generó.
+
+```{r sesion}
+sessionInfo()
+```
+
+# Referencias {.unnumbered}
+
+Centro de Investigación Científica y de Educación Superior de Ensenada. (2022). *Reporte final: Programa anual de monitoreo acústico de la población de vaquita marina* (PROREST 2022). CONANP.
+
+Diario Oficial de la Federación. (2026, 14 de octubre). *Acuerdo por el que se regulan artes, sistemas, métodos, técnicas y horarios para la realización de actividades de pesca con embarcaciones menores y mayores en Zonas Marinas Mexicanas en el Norte del Golfo de California*. https://sidof.segob.gob.mx/notas/docFuente/5801240
+
+Efron, B., & Tibshirani, R. J. (1993). *An introduction to the bootstrap*. Chapman and Hall.
+
+Jaramillo-Legorreta, A., Cardenas-Hinojosa, G., Nieto-Garcia, E., Rojas-Bracho, L., Ver Hoef, J., Moore, J., Tregenza, N., Barlow, J., Gerrodette, T., Thomas, L., & Taylor, B. (2017). Passive acoustic monitoring of the decline of Mexico's critically endangered vaquita. *Conservation Biology, 31*(1), 183–191. https://doi.org/10.1111/cobi.12789
